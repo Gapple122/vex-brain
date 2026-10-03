@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <thread>
+#include <chrono>
 #include <cstdio>
 
 // Defined exactly once in your robot code (main.cpp / robot-config.cpp):
@@ -25,6 +26,7 @@ namespace vex {
 std::atomic<bool> g_mousePressed(false);
 std::atomic<int>  g_mouseX(0);
 std::atomic<int>  g_mouseY(0);
+std::atomic<long long> g_pressTimeNs(0);
 
 HWND g_simulatorWindow = nullptr;
 
@@ -41,9 +43,6 @@ static constexpr int SCALE         = vex::kScale;          // 3
 
 static constexpr int WINDOW_WIDTH  = SCREEN_WIDTH  * SCALE; // 1440
 static constexpr int WINDOW_HEIGHT = SCREEN_HEIGHT * SCALE; // 720
-
-static constexpr UINT_PTR REFRESH_TIMER_ID = 1;
-static constexpr UINT     REFRESH_TIMER_MS = 16;            // ~60 Hz
 
 static const char* WINDOW_CLASS_NAME = "VEXBrainSimulatorWindow";
 
@@ -126,11 +125,15 @@ static void updateMousePosition(HWND hwnd, LPARAM lParam)
     RECT clientRect;
     GetClientRect(hwnd, &clientRect);
 
-    x = std::max(0, std::min(x, static_cast<int>(clientRect.right)  - 1));
-    y = std::max(0, std::min(y, static_cast<int>(clientRect.bottom) - 1));
+    const int cw = std::max(1, static_cast<int>(clientRect.right));
+    const int ch = std::max(1, static_cast<int>(clientRect.bottom));
 
-    int brainX = std::max(0, std::min(x / SCALE, SCREEN_WIDTH  - 1));
-    int brainY = std::max(0, std::min(y / SCALE, SCREEN_HEIGHT - 1));
+    x = std::max(0, std::min(x, cw - 1));
+    y = std::max(0, std::min(y, ch - 1));
+
+    // Scale by the actual client size so clicks line up with what is drawn.
+    int brainX = std::max(0, std::min(x * SCREEN_WIDTH  / cw, SCREEN_WIDTH  - 1));
+    int brainY = std::max(0, std::min(y * SCREEN_HEIGHT / ch, SCREEN_HEIGHT - 1));
 
     vex::g_mouseX.store(brainX);
     vex::g_mouseY.store(brainY);
@@ -147,23 +150,17 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     {
         case WM_CREATE:
         {
-            // The user program draws from another thread, so poll for
-            // changes and repaint at ~60 Hz.
-            SetTimer(hwnd, REFRESH_TIMER_ID, REFRESH_TIMER_MS, nullptr);
             return 0;
         }
 
-        case WM_TIMER:
-        {
-            if (wParam == REFRESH_TIMER_ID && Brain.Screen.takeDirty())
-                InvalidateRect(hwnd, nullptr, FALSE);
-
-            return 0;
-        }
-
+        // Like a real touchscreen: the position only follows the finger
+        // while it is down. Just hovering must not change xPosition()/
+        // yPosition(), or a click can "move" before the program reads it.
         case WM_MOUSEMOVE:
         {
-            updateMousePosition(hwnd, lParam);
+            if (vex::g_mousePressed.load())
+                updateMousePosition(hwnd, lParam);
+
             return 0;
         }
 
@@ -173,6 +170,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             SetCapture(hwnd);
             updateMousePosition(hwnd, lParam);
 
+            vex::g_pressTimeNs.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
             vex::g_mousePressed.store(true);
             Brain.Screen.notifyTouch(true);
 
@@ -181,8 +182,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_LBUTTONUP:
         {
-            updateMousePosition(hwnd, lParam);
-
             const bool wasPressed = vex::g_mousePressed.exchange(false);
 
             ReleaseCapture();
@@ -210,7 +209,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
 
-            Brain.Screen.paintToWindow(hdc);
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+
+            Brain.Screen.paintToWindow(hdc, cr.right, cr.bottom);
 
             EndPaint(hwnd, &ps);
             return 0;
@@ -231,7 +233,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_DESTROY:
         {
-            KillTimer(hwnd, REFRESH_TIMER_ID);
             vex::g_mousePressed.store(false);
             PostQuitMessage(0);
             return 0;
@@ -250,6 +251,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
     // Prevent Windows DPI scaling from changing our coordinates.
     SetProcessDPIAware();
+
+    // Windows sleeps in ~15.6 ms steps by default. Ask for 1 ms so
+    // wait(), render() and touch polling are responsive.
+    if (HMODULE winmm = LoadLibraryA("winmm.dll"))
+    {
+        using TimeBeginPeriodFn = UINT (WINAPI*)(UINT);
+
+        auto timeBeginPeriod = reinterpret_cast<TimeBeginPeriodFn>(
+            reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")));
+
+        if (timeBeginPeriod)
+            timeBeginPeriod(1);
+    }
 
 
     // 1. Create the window (hidden until the screen buffers exist).

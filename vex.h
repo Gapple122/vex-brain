@@ -32,6 +32,7 @@ namespace vex {
 extern std::atomic<bool> g_mousePressed;
 extern std::atomic<int>  g_mouseX;
 extern std::atomic<int>  g_mouseY;
+extern std::atomic<long long> g_pressTimeNs;   // time of the last touch-down
 
 extern HWND g_simulatorWindow;
 
@@ -44,6 +45,10 @@ inline constexpr int kScale        = 3;
 // double-buffered mode: the window only changes when render() is called.
 // If false, the window always shows what has been drawn so far.
 inline constexpr bool kRenderEnablesDoubleBuffer = true;
+
+// A touch is reported as "pressing" for at least this long, so a quick click
+// is not missed by a program that only checks the screen every 50-100 ms.
+inline constexpr int kMinPressMs = 100;
 
 
 // ============================================================
@@ -287,8 +292,29 @@ private:
     HGDIOBJ backOld_  = nullptr;
     HGDIOBJ frontOld_ = nullptr;
 
+    // Only the GUI thread touches this one (see paintToWindow).
+    HDC     paintDC_  = nullptr;
+    HBITMAP paintBmp_ = nullptr;
+    HGDIOBJ paintOld_ = nullptr;
+
     bool doubleBuffered_ = false;
     std::atomic<bool> dirty_{true};
+    std::atomic<bool> repaintQueued_{false};
+    std::chrono::steady_clock::time_point lastRender_{};
+
+    // Ask the window to repaint (at most one request outstanding).
+    void requestRepaint() {
+        dirty_ = true;
+        if (hwnd_ && !repaintQueued_.exchange(true))
+            InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    // Called after every drawing operation.
+    void markDirty() {
+        dirty_ = true;
+        if (!doubleBuffered_)
+            requestRepaint();
+    }
 
     // Set while the GUI thread wants to paint. Drawing threads step aside
     // so a program that draws in a tight loop cannot starve the window
@@ -300,7 +326,7 @@ private:
     public:
         explicit UserLock(brainScreen& s) {
             while (s.paintPending_.load())
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::yield();
             lock_ = std::unique_lock<std::mutex>(s.mutex_);
         }
     };
@@ -342,6 +368,7 @@ private:
     void releaseLocked() {
         destroyBuffer(backDC_, backBmp_, backOld_);
         destroyBuffer(frontDC_, frontBmp_, frontOld_);
+        destroyBuffer(paintDC_, paintBmp_, paintOld_);
 
         for (HFONT& f : fonts_) {
             if (f) DeleteObject(f);
@@ -445,17 +472,18 @@ private:
         SetTextColor(backDC_, detail::toColorRef(penColor_));
 
         if (detail::isMono(font_)) {
-            // Place every character in its own fixed-size cell.
-            int cx = x;
-            for (char c : s) {
-                if (opaque)
-                    fillPx(cx * kScale, yTop * kScale,
-                           (cx + cw) * kScale, (yTop + ch) * kScale,
-                           fillColor_);
+            // Fixed-size cells: one background fill, one text call.
+            const int len = static_cast<int>(s.length());
 
-                TextOutA(backDC_, cx * kScale, yTop * kScale, &c, 1);
-                cx += cw;
-            }
+            if (opaque)
+                fillPx(x * kScale, yTop * kScale,
+                       (x + len * cw) * kScale, (yTop + ch) * kScale,
+                       fillColor_);
+
+            std::vector<INT> dx(static_cast<size_t>(len), cw * kScale);
+
+            ExtTextOutA(backDC_, x * kScale, yTop * kScale, 0, nullptr,
+                        s.c_str(), len, dx.data());
         }
         else {
             SIZE sz{0, 0};
@@ -472,7 +500,7 @@ private:
         }
 
         SelectObject(backDC_, oldFont);
-        dirty_ = true;
+        markDirty();
     }
 
     void printLocked(const std::string& s) {
@@ -498,7 +526,7 @@ private:
         Rectangle(backDC_,
                   x * kScale, y * kScale,
                   (x + w) * kScale, (y + h) * kScale);
-        dirty_ = true;
+        markDirty();
     }
 
     void drawCircleLocked(int x, int y, int r, const color& fill) {
@@ -508,7 +536,7 @@ private:
         Ellipse(backDC_,
                 (x - r) * kScale, (y - r) * kScale,
                 (x + r) * kScale, (y + r) * kScale);
-        dirty_ = true;
+        markDirty();
     }
 
 
@@ -539,6 +567,7 @@ public:
         HDC screenDC = GetDC(nullptr);
         createBuffer(screenDC, backDC_,  backBmp_,  backOld_);
         createBuffer(screenDC, frontDC_, frontBmp_, frontOld_);
+        createBuffer(screenDC, paintDC_, paintBmp_, paintOld_);
         ReleaseDC(nullptr, screenDC);
 
         penColor_  = color::white;
@@ -550,7 +579,8 @@ public:
         cursorCol_ = 1;
 
         doubleBuffered_ = false;
-        dirty_ = true;
+        repaintQueued_ = false;
+        requestRepaint();
     }
 
 
@@ -559,21 +589,40 @@ public:
     // ========================================================
 
     // Draw the current Brain image onto the window.
-    void paintToWindow(HDC hdc) {
+    void paintToWindow(HDC hdc, int clientW, int clientH) {
 
+        // Hold the draw lock only for a fast memory-to-memory copy. The slow
+        // blit to the screen happens afterwards, so the program's drawing
+        // thread is never stuck waiting on the window.
         paintPending_ = true;
-        std::unique_lock<std::mutex> lock(mutex_);
-        paintPending_ = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            paintPending_ = false;
 
-        HDC src = doubleBuffered_ ? frontDC_ : backDC_;
+            // Anything drawn from now on needs another repaint.
+            repaintQueued_ = false;
 
-        if (!src) {
-            RECT rc{0, 0, bufW(), bufH()};
+            HDC src = doubleBuffered_ ? frontDC_ : backDC_;
+
+            if (src && paintDC_)
+                BitBlt(paintDC_, 0, 0, bufW(), bufH(), src, 0, 0, SRCCOPY);
+        }
+
+        if (!paintDC_) {
+            RECT rc{0, 0, clientW, clientH};
             FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
             return;
         }
 
-        BitBlt(hdc, 0, 0, bufW(), bufH(), src, 0, 0, SRCCOPY);
+        if (clientW == bufW() && clientH == bufH()) {
+            BitBlt(hdc, 0, 0, bufW(), bufH(), paintDC_, 0, 0, SRCCOPY);
+        }
+        else {
+            SetStretchBltMode(hdc, HALFTONE);
+            SetBrushOrgEx(hdc, 0, 0, nullptr);
+            StretchBlt(hdc, 0, 0, clientW, clientH,
+                       paintDC_, 0, 0, bufW(), bufH(), SRCCOPY);
+        }
     }
 
     // True (once) if something changed since the last call.
@@ -605,6 +654,8 @@ public:
 
     void render(bool vsyncWait, bool = true) {
 
+        std::chrono::steady_clock::time_point wakeAt;
+
         {
             UserLock lock(*this);
 
@@ -615,12 +666,18 @@ public:
                 BitBlt(frontDC_, 0, 0, bufW(), bufH(),
                        backDC_, 0, 0, SRCCOPY);
 
-            dirty_ = true;
+            requestRepaint();
+
+            // Real render() paces a program to the screen refresh. Only
+            // sleep for whatever is left of the frame, never a fixed delay.
+            auto now = std::chrono::steady_clock::now();
+            wakeAt = std::max(now, lastRender_ +
+                                   std::chrono::microseconds(8333));
+            lastRender_ = wakeAt;
         }
 
-        // The real render() paces the program at the screen refresh rate.
         if (vsyncWait)
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            std::this_thread::sleep_until(wakeAt);
     }
 
 
@@ -637,7 +694,7 @@ public:
         cursorRow_ = 1;
         cursorCol_ = 1;
 
-        dirty_ = true;
+        markDirty();
     }
 
     void clearScreen(int r, int g, int b) {
@@ -654,7 +711,7 @@ public:
                bufW(), row * ch * kScale, c);
 
         cursorCol_ = 1;
-        dirty_ = true;
+        markDirty();
     }
 
     void clearLine() {
@@ -800,7 +857,7 @@ public:
         SelectObject(backDC_, old);
         DeleteObject(pen);
 
-        dirty_ = true;
+        markDirty();
     }
 
     void drawRectangle(int x, int y, int width, int height) {
@@ -831,7 +888,7 @@ public:
                (x + 1) * kScale, (y + 1) * kScale,
                penColor_);
 
-        dirty_ = true;
+        markDirty();
     }
 
 
@@ -839,7 +896,23 @@ public:
     // Touchscreen
     // ========================================================
 
-    bool pressing() { return g_mousePressed.load(); }
+    bool pressing() {
+
+        if (g_mousePressed.load())
+            return true;
+
+        // Keep a short click "down" long enough for slow polling loops.
+        const long long t = g_pressTimeNs.load();
+
+        if (t == 0)
+            return false;
+
+        const long long now =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        return (now - t) < static_cast<long long>(kMinPressMs) * 1000000LL;
+    }
     int  xPosition() { return g_mouseX.load(); }
     int  yPosition() { return g_mouseY.load(); }
 
@@ -858,6 +931,12 @@ public:
         g_mouseX.store(x);
         g_mouseY.store(y);
         g_mousePressed.store(pressed);
+
+        if (pressed)
+            g_pressTimeNs.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
     }
 };
 
